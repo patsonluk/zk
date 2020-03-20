@@ -534,6 +534,7 @@ func (c *Conn) invalidateWatches(err error) {
 	if len(c.watchers) >= 0 {
 		for pathType, watchers := range c.watchers {
 			ev := Event{Type: EventNotWatching, State: StateDisconnected, Path: pathType.path, Err: err}
+			c.sendEvent(ev) // FullStory: also publish globally for zkwatcherman.
 			for _, ch := range watchers {
 				ch <- ev
 				close(ch)
