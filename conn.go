@@ -28,7 +28,7 @@ import (
 var ErrNoServer = errors.New("zk: could not connect to a server")
 
 // ErrInvalidPath indicates that an operation was being attempted on
-// an invalid path. (e.g. empty path)
+// an invalid path. (e.g. empty path).
 var ErrInvalidPath = errors.New("zk: invalid path")
 
 // DefaultLogger uses the stdlib log package for logging.
@@ -44,16 +44,23 @@ const (
 type watchType int
 
 const (
-	watchTypeData = iota
+	watchTypeData watchType = iota
 	watchTypeExist
 	watchTypeChild
+	watchTypePersistent
+	watchTypePersistentRecursive
 )
+
+func (w watchType) isPersistent() bool {
+	return w == watchTypePersistent || w == watchTypePersistentRecursive
+}
 
 type watchPathType struct {
 	path  string
 	wType watchType
 }
 
+// Dialer is a function to be used to establish a connection to a single host.
 type Dialer func(network, address string, timeout time.Duration) (net.Conn, error)
 
 // Logger is an interface that can be implemented to provide custom log output.
@@ -66,6 +73,7 @@ type authCreds struct {
 	auth   []byte
 }
 
+// Conn is the client connection and tracks all details for communication with the server.
 type Conn struct {
 	lastZxid         int64
 	sessionID        int64
@@ -94,7 +102,7 @@ type Conn struct {
 	sendChan     chan *request
 	requests     map[int32]*request // Xid -> pending request
 	requestsLock sync.Mutex
-	watchers     map[watchPathType][]chan Event
+	watchers     map[watchPathType][]EventQueue
 	watchersLock sync.Mutex
 	closeChan    chan struct{} // channel to tell send loop stop
 
@@ -138,6 +146,8 @@ type response struct {
 	err  error
 }
 
+// Event is an Znode event sent by the server.
+// Refer to EventType for more details.
 type Event struct {
 	Type   EventType
 	State  State
@@ -195,7 +205,7 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		connectTimeout: 1 * time.Second,
 		sendChan:       make(chan *request, sendChanSize),
 		requests:       make(map[int32]*request),
-		watchers:       make(map[watchPathType][]chan Event),
+		watchers:       make(map[watchPathType][]EventQueue),
 		passwd:         emptyPassword,
 		logger:         DefaultLogger,
 		logInfo:        true, // default is true for backwards compatability
@@ -239,7 +249,7 @@ func WithHostProvider(hostProvider HostProvider) connOption {
 	}
 }
 
-// WithLogger returns a connection option specifying a non-default Logger
+// WithLogger returns a connection option specifying a non-default Logger.
 func WithLogger(logger Logger) connOption {
 	return func(c *Conn) {
 		c.logger = logger
@@ -247,7 +257,7 @@ func WithLogger(logger Logger) connOption {
 }
 
 // WithLogInfo returns a connection option specifying whether or not information messages
-// shoud be logged.
+// should be logged.
 func WithLogInfo(logInfo bool) connOption {
 	return func(c *Conn) {
 		c.logInfo = logInfo
@@ -297,7 +307,7 @@ func WithMaxBufferSize(maxBufferSize int) connOption {
 }
 
 // WithMaxConnBufferSize sets maximum buffer size used to send and encode
-// packets to Zookeeper server. The standard Zookeepeer client for java defaults
+// packets to Zookeeper server. The standard Zookeeper client for java defaults
 // to a limit of 1mb. This option should be used for non-standard server setup
 // where znode is bigger than default 1mb.
 func WithMaxConnBufferSize(maxBufferSize int) connOption {
@@ -526,21 +536,70 @@ func (c *Conn) flushRequests(err error) {
 	c.requestsLock.Unlock()
 }
 
+var eventWatchTypes = map[EventType][]watchType{
+	EventNodeCreated:         {watchTypeExist, watchTypePersistent, watchTypePersistentRecursive},
+	EventNodeDataChanged:     {watchTypeExist, watchTypeData, watchTypePersistent, watchTypePersistentRecursive},
+	EventNodeChildrenChanged: {watchTypeChild, watchTypePersistent},
+	EventNodeDeleted:         {watchTypeExist, watchTypeData, watchTypeChild, watchTypePersistent, watchTypePersistentRecursive},
+}
+var persistentWatchTypes = []watchType{watchTypePersistent, watchTypePersistentRecursive}
+
+// Send event to all interested watchers
+func (c *Conn) notifyWatches(ev Event) {
+	wTypes := eventWatchTypes[ev.Type]
+	if len(wTypes) == 0 {
+		return
+	}
+
+	c.watchersLock.Lock()
+	defer c.watchersLock.Unlock()
+
+	broadcast := func(wpt watchPathType) {
+		for _, ch := range c.watchers[wpt] {
+			ch.push(ev)
+			if !wpt.wType.isPersistent() {
+				ch.close()
+			}
+			delete(c.watchers, wpt)
+		}
+	}
+
+	for _, t := range wTypes {
+		if t == watchTypePersistentRecursive {
+			for p := ev.Path; ; p, _ = SplitPath(p) {
+				broadcast(watchPathType{p, t})
+				if p == "/" {
+					break
+				}
+			}
+		} else {
+			broadcast(watchPathType{ev.Path, t})
+		}
+	}
+}
+
 // Send error to all watchers and clear watchers map
 func (c *Conn) invalidateWatches(err error) {
 	c.watchersLock.Lock()
 	defer c.watchersLock.Unlock()
 
-	if len(c.watchers) >= 0 {
+	if len(c.watchers) > 0 {
 		for pathType, watchers := range c.watchers {
-			ev := Event{Type: EventNotWatching, State: StateDisconnected, Path: pathType.path, Err: err}
-			c.sendEvent(ev) // FullStory: also publish globally for zkwatcherman.
-			for _, ch := range watchers {
-				ch <- ev
-				close(ch)
+			if err == ErrSessionExpired && pathType.wType.isPersistent() {
+				// Ignore ErrSessionExpired for persistent watchers as the client will either automatically reconnect,
+				// or this is a shutdown-worthy error in which case there will be a followup invocation of this method
+				// with ErrClosing
+				continue
 			}
+
+			ev := Event{Type: EventNotWatching, State: StateDisconnected, Path: pathType.path, Err: err}
+			c.sendEvent(ev) // also publish globally
+			for _, ch := range watchers {
+				ch.push(ev)
+				ch.close()
+			}
+			delete(c.watchers, pathType)
 		}
-		c.watchers = make(map[watchPathType][]chan Event)
 	}
 }
 
@@ -579,12 +638,7 @@ func (c *Conn) sendSetWatches() {
 				reqs = append(reqs, req)
 			}
 			sizeSoFar = 28 // fixed overhead of a set-watches packet
-			req = &setWatchesRequest{
-				RelativeZxid: atomic.LoadInt64(&c.lastZxid),
-				DataWatches:  make([]string, 0),
-				ExistWatches: make([]string, 0),
-				ChildWatches: make([]string, 0),
-			}
+			req = &setWatchesRequest{RelativeZxid: atomic.LoadInt64(&c.lastZxid)}
 		}
 		sizeSoFar += addlLen
 		switch pathType.wType {
@@ -594,6 +648,10 @@ func (c *Conn) sendSetWatches() {
 			req.ExistWatches = append(req.ExistWatches, pathType.path)
 		case watchTypeChild:
 			req.ChildWatches = append(req.ChildWatches, pathType.path)
+		case watchTypePersistent:
+			req.PersistentWatches = append(req.PersistentWatches, pathType.path)
+		case watchTypePersistentRecursive:
+			req.PersistentRecursiveWatches = append(req.PersistentRecursiveWatches, pathType.path)
 		}
 		n++
 	}
@@ -615,7 +673,37 @@ func (c *Conn) sendSetWatches() {
 		// aren't failure modes where a blocking write to the channel of requests
 		// could hang indefinitely and cause this goroutine to leak...
 		for _, req := range reqs {
-			_, err := c.request(opSetWatches, req, res, nil)
+			var op int32 = opSetWatches
+			if len(req.PersistentWatches) > 0 || len(req.PersistentRecursiveWatches) > 0 {
+				// to maintain compatibility with older servers, only send opSetWatches2 if persistent watches are used
+				op = opSetWatches2
+			}
+
+			_, err := c.request(op, req, res, func(r *request, header *responseHeader, err error) {
+				if err == nil && op == opSetWatches2 {
+					// If the setWatches was successful, notify the persistent watchers they've been reconnected.
+					// Because we process responses in one routine, we know that the following will execute before
+					// subsequent responses are processed. This means we won't end up in a situation where events are
+					// sent to watchers before the reconnect event is sent.
+					c.watchersLock.Lock()
+					defer c.watchersLock.Unlock()
+					for _, wt := range persistentWatchTypes {
+						var paths []string
+						if wt == watchTypePersistent {
+							paths = req.PersistentWatches
+						} else {
+							paths = req.PersistentRecursiveWatches
+						}
+						for _, p := range paths {
+							e := Event{Type: EventWatching, State: StateConnected, Path: p}
+							c.sendEvent(e) // also publish globally
+							for _, ch := range c.watchers[watchPathType{path: p, wType: wt}] {
+								ch.push(e)
+							}
+						}
+					}
+				}
+			})
 			if err != nil {
 				c.logger.Printf("Failed to set previous watches: %v", err)
 				break
@@ -796,39 +884,19 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 		}
 
 		if res.Xid == -1 {
-			res := &watcherEvent{}
-			_, err := decodePacket(buf[16:blen], res)
+			we := &watcherEvent{}
+			_, err = decodePacket(buf[16:blen], we)
 			if err != nil {
 				return err
 			}
 			ev := Event{
-				Type:  res.Type,
-				State: res.State,
-				Path:  res.Path,
+				Type:  we.Type,
+				State: we.State,
+				Path:  we.Path,
 				Err:   nil,
 			}
 			c.sendEvent(ev)
-			wTypes := make([]watchType, 0, 2)
-			switch res.Type {
-			case EventNodeCreated:
-				wTypes = append(wTypes, watchTypeExist)
-			case EventNodeDeleted, EventNodeDataChanged:
-				wTypes = append(wTypes, watchTypeExist, watchTypeData, watchTypeChild)
-			case EventNodeChildrenChanged:
-				wTypes = append(wTypes, watchTypeChild)
-			}
-			c.watchersLock.Lock()
-			for _, t := range wTypes {
-				wpt := watchPathType{res.Path, t}
-				if watchers := c.watchers[wpt]; watchers != nil && len(watchers) > 0 {
-					for _, ch := range watchers {
-						ch <- ev
-						close(ch)
-					}
-					delete(c.watchers, wpt)
-				}
-			}
-			c.watchersLock.Unlock()
+			c.notifyWatches(ev)
 		} else if res.Xid == -2 {
 			// Ping response. Ignore.
 		} else if res.Xid < 0 {
@@ -869,14 +937,15 @@ func (c *Conn) nextXid() int32 {
 	return int32(atomic.AddUint32(&c.xid, 1) & 0x7fffffff)
 }
 
-func (c *Conn) addWatcher(path string, watchType watchType) <-chan Event {
+func (c *Conn) addWatcher(path string, watchType watchType, ch EventQueue) {
 	c.watchersLock.Lock()
 	defer c.watchersLock.Unlock()
 
-	ch := make(chan Event, 1)
 	wpt := watchPathType{path, watchType}
 	c.watchers[wpt] = append(c.watchers[wpt], ch)
-	return ch
+	if watchType.isPersistent() {
+		ch.push(Event{Type: EventWatching, State: StateConnected, Path: path})
+	}
 }
 
 func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) <-chan response {
@@ -918,8 +987,10 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 }
 
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
-	r := <-c.queueRequest(opcode, req, res, recvFunc)
+	recv := c.queueRequest(opcode, req, res, recvFunc)
 	select {
+	case r := <-recv:
+		return r.zxid, r.err
 	case <-c.shouldQuit:
 		// queueRequest() can be racy, double-check for the race here and avoid
 		// a potential data-race. otherwise the client of this func may try to
@@ -927,11 +998,10 @@ func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc 
 		// NOTE: callers of this func should check for (at least) ErrConnectionClosed
 		// and avoid accessing fields of the response object if such error is present.
 		return -1, ErrConnectionClosed
-	default:
-		return r.zxid, r.err
 	}
 }
 
+// AddAuth adds an authentication config to the connection.
 func (c *Conn) AddAuth(scheme string, auth []byte) error {
 	_, err := c.request(opSetAuth, &setAuthRequest{Type: 0, Scheme: scheme, Auth: auth}, &setAuthResponse{}, nil)
 
@@ -942,7 +1012,7 @@ func (c *Conn) AddAuth(scheme string, auth []byte) error {
 	// Remember authdata so that it can be re-submitted on reconnect
 	//
 	// FIXME(prozlach): For now we treat "userfoo:passbar" and "userfoo:passbar2"
-	// as two different entries, which will be re-submitted on reconnet. Some
+	// as two different entries, which will be re-submitted on reconnect. Some
 	// research is needed on how ZK treats these cases and
 	// then maybe switch to something like "map[username] = password" to allow
 	// only single password for given user with users being unique.
@@ -958,6 +1028,7 @@ func (c *Conn) AddAuth(scheme string, auth []byte) error {
 	return nil
 }
 
+// Children returns the children of a znode.
 func (c *Conn) Children(path string) ([]string, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, nil, err
@@ -968,27 +1039,30 @@ func (c *Conn) Children(path string) ([]string, *Stat, error) {
 	if err == ErrConnectionClosed {
 		return nil, nil, err
 	}
-	return res.Children, &res.Stat, err
+	return res.Children, res.Stat, err
 }
 
+// ChildrenW returns the children of a znode and sets a watch.
 func (c *Conn) ChildrenW(path string) ([]string, *Stat, <-chan Event, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, nil, nil, err
 	}
 
-	var ech <-chan Event
+	var ech chanEventQueue
 	res := &getChildren2Response{}
 	_, err := c.request(opGetChildren2, &getChildren2Request{Path: path, Watch: true}, res, func(req *request, res *responseHeader, err error) {
 		if err == nil {
-			ech = c.addWatcher(path, watchTypeChild)
+			ech = newChanEventChannel()
+			c.addWatcher(path, watchTypeChild, ech)
 		}
 	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return res.Children, &res.Stat, ech, err
+	return res.Children, res.Stat, ech, err
 }
 
+// Get gets the contents of a znode.
 func (c *Conn) Get(path string) ([]byte, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, nil, err
@@ -999,7 +1073,7 @@ func (c *Conn) Get(path string) ([]byte, *Stat, error) {
 	if err == ErrConnectionClosed {
 		return nil, nil, err
 	}
-	return res.Data, &res.Stat, err
+	return res.Data, res.Stat, err
 }
 
 // GetW returns the contents of a znode and sets a watch
@@ -1008,19 +1082,21 @@ func (c *Conn) GetW(path string) ([]byte, *Stat, <-chan Event, error) {
 		return nil, nil, nil, err
 	}
 
-	var ech <-chan Event
+	var ech chanEventQueue
 	res := &getDataResponse{}
 	_, err := c.request(opGetData, &getDataRequest{Path: path, Watch: true}, res, func(req *request, res *responseHeader, err error) {
 		if err == nil {
-			ech = c.addWatcher(path, watchTypeData)
+			ech = newChanEventChannel()
+			c.addWatcher(path, watchTypeData, ech)
 		}
 	})
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	return res.Data, &res.Stat, ech, err
+	return res.Data, res.Stat, ech, err
 }
 
+// Set updates the contents of a znode.
 func (c *Conn) Set(path string, data []byte, version int32) (*Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, err
@@ -1031,12 +1107,20 @@ func (c *Conn) Set(path string, data []byte, version int32) (*Stat, error) {
 	if err == ErrConnectionClosed {
 		return nil, err
 	}
-	return &res.Stat, err
+	return res.Stat, err
 }
 
+// Create creates a znode. If acl is empty, it uses the global WorldACL with PermAll
+// The returned path is the new path assigned by the server, it may not be the
+// same as the input, for example when creating a sequence znode the returned path
+// will be the input path with a sequence number appended.
 func (c *Conn) Create(path string, data []byte, flags int32, acl []ACL) (string, error) {
 	if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
 		return "", err
+	}
+
+	if len(acl) == 0 {
+		acl = WorldACL(PermAll)
 	}
 
 	res := &createResponse{}
@@ -1047,6 +1131,25 @@ func (c *Conn) Create(path string, data []byte, flags int32, acl []ACL) (string,
 	return res.Path, err
 }
 
+// CreateAndReturnStat is the equivalent of Create, but it also returns the Stat of the created node.
+func (c *Conn) CreateAndReturnStat(path string, data []byte, flags int32, acl []ACL) (string, *Stat, error) {
+	if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
+		return "", nil, err
+	}
+
+	if len(acl) == 0 {
+		acl = WorldACL(PermAll)
+	}
+
+	res := &create2Response{}
+	_, err := c.request(opCreate2, &CreateRequest{path, data, acl, flags}, res, nil)
+	if err == ErrConnectionClosed {
+		return "", nil, err
+	}
+	return res.Path, res.Stat, err
+}
+
+// CreateContainer creates a container znode and returns the path.
 func (c *Conn) CreateContainer(path string, data []byte, flags int32, acl []ACL) (string, error) {
 	if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
 		return "", err
@@ -1060,6 +1163,7 @@ func (c *Conn) CreateContainer(path string, data []byte, flags int32, acl []ACL)
 	return res.Path, err
 }
 
+// CreateTTL creates a TTL znode, which will be automatically deleted by server after the TTL.
 func (c *Conn) CreateTTL(path string, data []byte, flags int32, acl []ACL, ttl time.Duration) (string, error) {
 	if err := validatePath(path, flags&FlagSequence == FlagSequence); err != nil {
 		return "", err
@@ -1122,6 +1226,7 @@ func (c *Conn) CreateProtectedEphemeralSequential(path string, data []byte, acl 
 	return "", err
 }
 
+// Delete deletes a znode.
 func (c *Conn) Delete(path string, version int32) error {
 	if err := validatePath(path, false); err != nil {
 		return err
@@ -1131,6 +1236,7 @@ func (c *Conn) Delete(path string, version int32) error {
 	return err
 }
 
+// Exists tells the existence of a znode.
 func (c *Conn) Exists(path string) (bool, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return false, nil, err
@@ -1146,21 +1252,23 @@ func (c *Conn) Exists(path string) (bool, *Stat, error) {
 		exists = false
 		err = nil
 	}
-	return exists, &res.Stat, err
+	return exists, res.Stat, err
 }
 
+// ExistsW tells the existence of a znode and sets a watch.
 func (c *Conn) ExistsW(path string) (bool, *Stat, <-chan Event, error) {
 	if err := validatePath(path, false); err != nil {
 		return false, nil, nil, err
 	}
 
-	var ech <-chan Event
+	var ech chanEventQueue
 	res := &existsResponse{}
 	_, err := c.request(opExists, &existsRequest{Path: path, Watch: true}, res, func(req *request, res *responseHeader, err error) {
+		ech = newChanEventChannel()
 		if err == nil {
-			ech = c.addWatcher(path, watchTypeData)
+			c.addWatcher(path, watchTypeData, ech)
 		} else if err == ErrNoNode {
-			ech = c.addWatcher(path, watchTypeExist)
+			c.addWatcher(path, watchTypeExist, ech)
 		}
 	})
 	exists := true
@@ -1171,9 +1279,10 @@ func (c *Conn) ExistsW(path string) (bool, *Stat, <-chan Event, error) {
 	if err != nil {
 		return false, nil, nil, err
 	}
-	return exists, &res.Stat, ech, err
+	return exists, res.Stat, ech, err
 }
 
+// GetACL gets the ACLs of a znode.
 func (c *Conn) GetACL(path string) ([]ACL, *Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, nil, err
@@ -1184,8 +1293,10 @@ func (c *Conn) GetACL(path string) ([]ACL, *Stat, error) {
 	if err == ErrConnectionClosed {
 		return nil, nil, err
 	}
-	return res.Acl, &res.Stat, err
+	return res.Acl, res.Stat, err
 }
+
+// SetACL updates the ACLs of a znode.
 func (c *Conn) SetACL(path string, acl []ACL, version int32) (*Stat, error) {
 	if err := validatePath(path, false); err != nil {
 		return nil, err
@@ -1196,9 +1307,12 @@ func (c *Conn) SetACL(path string, acl []ACL, version int32) (*Stat, error) {
 	if err == ErrConnectionClosed {
 		return nil, err
 	}
-	return &res.Stat, err
+	return res.Stat, err
 }
 
+// Sync flushes the channel between process and the leader of a given znode,
+// you may need it if you want identical views of ZooKeeper data for 2 client instances.
+// Please refer to the "Consistency Guarantees" section of ZK document for more details.
 func (c *Conn) Sync(path string) (string, error) {
 	if err := validatePath(path, false); err != nil {
 		return "", err
@@ -1212,6 +1326,7 @@ func (c *Conn) Sync(path string) (string, error) {
 	return res.Path, err
 }
 
+// MultiResponse is the result of a Multi call.
 type MultiResponse struct {
 	Stat   *Stat
 	String string
@@ -1223,8 +1338,7 @@ type MultiResponse struct {
 // *CheckVersionRequest.
 func (c *Conn) Multi(ops ...interface{}) ([]MultiResponse, error) {
 	req := &multiRequest{
-		Ops:        make([]multiRequestOp, 0, len(ops)),
-		DoneHeader: multiHeader{Type: -1, Done: true, Err: -1},
+		Ops: make([]multiRequestOp, 0, len(ops)),
 	}
 	for _, op := range ops {
 		var opCode int32
@@ -1252,6 +1366,44 @@ func (c *Conn) Multi(ops ...interface{}) ([]MultiResponse, error) {
 		mr[i] = MultiResponse{Stat: op.Stat, String: op.String, Error: op.Err.toError()}
 	}
 	return mr, err
+}
+
+// MultiRead executes multiple ZooKeeper read operations at once. The provided ops must be one of GetDataOp or
+// GetChildrenOp. Returns an error on network or connectivity errors, not on any op errors such as ErrNoNode. To check
+// if any ops failed, check the corresponding MultiReadResponse.Err.
+func (c *Conn) MultiRead(ops ...ReadOp) ([]MultiReadResponse, error) {
+	req := &multiRequest{
+		Ops: make([]multiRequestOp, len(ops)),
+	}
+	for i, op := range ops {
+		req.Ops[i] = multiRequestOp{
+			Header: multiHeader{op.opCode(), false, -1},
+			Op:     pathWatchRequest{Path: op.GetPath()},
+		}
+	}
+	res := &multiReadResponse{}
+	_, err := c.request(opMultiRead, req, res, nil)
+	return res.OpResults, err
+}
+
+// GetDataAndChildren executes a multi-read to get the given node's data and its children in one call.
+func (c *Conn) GetDataAndChildren(path string) ([]byte, *Stat, []string, error) {
+	if err := validatePath(path, false); err != nil {
+		return nil, nil, nil, err
+	}
+
+	opResults, err := c.MultiRead(GetDataOp(path), GetChildrenOp(path))
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	for _, r := range opResults {
+		if r.Err != nil {
+			return nil, nil, nil, r.Err
+		}
+	}
+
+	return opResults[0].Data, opResults[0].Stat, opResults[1].Children, nil
 }
 
 // IncrementalReconfig is the zookeeper reconfiguration api that allows adding and removing servers
@@ -1289,7 +1441,7 @@ func (c *Conn) Reconfig(members []string, version int64) (*Stat, error) {
 func (c *Conn) internalReconfig(request *reconfigRequest) (*Stat, error) {
 	response := &reconfigReponse{}
 	_, err := c.request(opReconfig, request, response, nil)
-	return &response.Stat, err
+	return response.Stat, err
 }
 
 // Server returns the current or last-connected server name.
@@ -1297,6 +1449,97 @@ func (c *Conn) Server() string {
 	c.serverMu.Lock()
 	defer c.serverMu.Unlock()
 	return c.server
+}
+
+func (c *Conn) AddPersistentWatch(path string, mode AddWatchMode) (ch EventQueue, err error) {
+	if err = validatePath(path, false); err != nil {
+		return nil, err
+	}
+
+	res := &addWatchResponse{}
+	_, err = c.request(opAddWatch, &addWatchRequest{Path: path, Mode: mode}, res, func(r *request, header *responseHeader, err error) {
+		if err == nil {
+			var wt watchType
+			if mode == AddWatchModePersistent {
+				wt = watchTypePersistent
+			} else {
+				wt = watchTypePersistentRecursive
+			}
+
+			ch = newUnlimitedEventQueue()
+			c.addWatcher(path, wt, ch)
+		}
+	})
+	if err == ErrConnectionClosed {
+		return nil, err
+	}
+	return ch, err
+}
+
+func (c *Conn) RemovePersistentWatch(path string, ch EventQueue) (err error) {
+	if err = validatePath(path, false); err != nil {
+		return err
+	}
+
+	deleted := false
+
+	res := &checkWatchesResponse{}
+	_, err = c.request(opCheckWatches, &checkWatchesRequest{Path: path, Type: WatcherTypeAny}, res, func(r *request, header *responseHeader, err error) {
+		if err != nil {
+			return
+		}
+
+		c.watchersLock.Lock()
+		defer c.watchersLock.Unlock()
+
+		for _, wt := range persistentWatchTypes {
+			wpt := watchPathType{path: path, wType: wt}
+			for i, w := range c.watchers[wpt] {
+				if w == ch {
+					deleted = true
+					c.watchers[wpt] = append(c.watchers[wpt][:i], c.watchers[wpt][i+1:]...)
+					w.push(Event{Type: EventNotWatching, State: c.State(), Path: path, Err: ErrNoWatcher})
+					w.close()
+					return
+				}
+			}
+		}
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if !deleted {
+		return ErrNoWatcher
+	}
+
+	return nil
+}
+
+func (c *Conn) RemoveAllPersistentWatches(path string) (err error) {
+	if err = validatePath(path, false); err != nil {
+		return err
+	}
+
+	res := &checkWatchesResponse{}
+	_, err = c.request(opRemoveWatches, &checkWatchesRequest{Path: path, Type: WatcherTypeAny}, res, func(r *request, header *responseHeader, err error) {
+		if err != nil {
+			return
+		}
+
+		c.watchersLock.Lock()
+		defer c.watchersLock.Unlock()
+		for _, wt := range persistentWatchTypes {
+			wpt := watchPathType{path: path, wType: wt}
+			for _, ch := range c.watchers[wpt] {
+				ch.push(Event{Type: EventNotWatching, State: c.State(), Path: path, Err: ErrNoWatcher})
+				ch.close()
+			}
+			delete(c.watchers, wpt)
+		}
+	})
+	return err
 }
 
 func resendZkAuth(ctx context.Context, c *Conn) error {
@@ -1351,9 +1594,29 @@ func resendZkAuth(ctx context.Context, c *Conn) error {
 			return ctx.Err()
 		}
 		if res.err != nil {
-			return fmt.Errorf("failed conneciton setAuth request: %v", res.err)
+			return fmt.Errorf("failed connection setAuth request: %v", res.err)
 		}
 	}
 
 	return nil
+}
+
+func JoinPath(parent, child string) string {
+	if !strings.HasSuffix(parent, "/") {
+		parent += "/"
+	}
+	if strings.HasPrefix(child, "/") {
+		child = child[1:]
+	}
+	return parent + child
+}
+
+func SplitPath(path string) (dir, name string) {
+	i := strings.LastIndex(path, "/")
+	if i == 0 {
+		dir, name = "/", path[1:]
+	} else {
+		dir, name = path[:i], path[i+1:]
+	}
+	return dir, name
 }

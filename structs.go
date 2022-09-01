@@ -3,6 +3,7 @@ package zk
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"log"
 	"reflect"
 	"runtime"
@@ -18,8 +19,8 @@ var (
 
 type defaultLogger struct{}
 
-func (defaultLogger) Printf(format string, a ...interface{}) {
-	log.Printf(format, a...)
+func (defaultLogger) Printf(format string, v ...interface{}) {
+	log.Output(3, fmt.Sprintf(format, v...))
 }
 
 type ACL struct {
@@ -134,7 +135,7 @@ type pathResponse struct {
 }
 
 type statResponse struct {
-	Stat Stat
+	Stat *Stat
 }
 
 //
@@ -176,6 +177,10 @@ type CreateTTLRequest struct {
 }
 
 type createResponse pathResponse
+type create2Response struct {
+	Path string
+	Stat *Stat
+}
 type DeleteRequest PathVersionRequest
 type deleteResponse struct{}
 
@@ -189,7 +194,7 @@ type getAclRequest pathRequest
 
 type getAclResponse struct {
 	Acl  []ACL
-	Stat Stat
+	Stat *Stat
 }
 
 type getChildrenRequest pathRequest
@@ -198,18 +203,59 @@ type getChildrenResponse struct {
 	Children []string
 }
 
+type ReadOp interface {
+	GetPath() string
+	IsGetData() bool
+	IsGetChildren() bool
+	opCode() int32
+}
+
 type getChildren2Request pathWatchRequest
+type GetChildrenOp string
+
+func (g GetChildrenOp) IsGetData() bool {
+	return false
+}
+
+func (g GetChildrenOp) IsGetChildren() bool {
+	return true
+}
+
+func (g GetChildrenOp) GetPath() string {
+	return string(g)
+}
+
+func (g GetChildrenOp) opCode() int32 {
+	return opGetChildren
+}
 
 type getChildren2Response struct {
 	Children []string
-	Stat     Stat
+	Stat     *Stat
 }
 
 type getDataRequest pathWatchRequest
+type GetDataOp string
+
+func (g GetDataOp) IsGetData() bool {
+	return true
+}
+
+func (g GetDataOp) IsGetChildren() bool {
+	return false
+}
+
+func (g GetDataOp) GetPath() string {
+	return string(g)
+}
+
+func (g GetDataOp) opCode() int32 {
+	return opGetData
+}
 
 type getDataResponse struct {
 	Data []byte
-	Stat Stat
+	Stat *Stat
 }
 
 type getMaxChildrenRequest pathRequest
@@ -255,10 +301,12 @@ type setSaslResponse struct {
 }
 
 type setWatchesRequest struct {
-	RelativeZxid int64
-	DataWatches  []string
-	ExistWatches []string
-	ChildWatches []string
+	RelativeZxid               int64
+	DataWatches                []string
+	ExistWatches               []string
+	ChildWatches               []string
+	PersistentWatches          []string
+	PersistentRecursiveWatches []string
 }
 
 type setWatchesResponse struct{}
@@ -274,8 +322,7 @@ type multiRequestOp struct {
 	Op     interface{}
 }
 type multiRequest struct {
-	Ops        []multiRequestOp
-	DoneHeader multiHeader
+	Ops []multiRequestOp
 }
 type multiResponseOp struct {
 	Header multiHeader
@@ -284,8 +331,15 @@ type multiResponseOp struct {
 	Err    ErrCode
 }
 type multiResponse struct {
-	Ops        []multiResponseOp
-	DoneHeader multiHeader
+	Ops []multiResponseOp
+}
+type MultiReadResponse struct {
+	getDataResponse
+	getChildrenResponse
+	Err error
+}
+type multiReadResponse struct {
+	OpResults []MultiReadResponse
 }
 
 // zk version 3.5 reconfig API
@@ -300,6 +354,20 @@ type reconfigRequest struct {
 
 type reconfigReponse getDataResponse
 
+type addWatchRequest struct {
+	Path string
+	Mode AddWatchMode
+}
+
+type addWatchResponse struct{}
+
+type checkWatchesRequest struct {
+	Path string
+	Type WatcherType
+}
+
+type checkWatchesResponse struct{}
+
 func (r *multiRequest) Encode(buf []byte) (int, error) {
 	total := 0
 	for _, op := range r.Ops {
@@ -310,8 +378,7 @@ func (r *multiRequest) Encode(buf []byte) (int, error) {
 		}
 		total += n
 	}
-	r.DoneHeader.Done = true
-	n, err := encodePacketValue(buf[total:], reflect.ValueOf(r.DoneHeader))
+	n, err := encodePacketValue(buf[total:], reflect.ValueOf(multiHeader{Type: -1, Done: true, Err: -1}))
 	if err != nil {
 		return total, err
 	}
@@ -322,7 +389,6 @@ func (r *multiRequest) Encode(buf []byte) (int, error) {
 
 func (r *multiRequest) Decode(buf []byte) (int, error) {
 	r.Ops = make([]multiRequestOp, 0)
-	r.DoneHeader = multiHeader{-1, true, -1}
 	total := 0
 	for {
 		header := &multiHeader{}
@@ -332,7 +398,6 @@ func (r *multiRequest) Decode(buf []byte) (int, error) {
 		}
 		total += n
 		if header.Done {
-			r.DoneHeader = *header
 			break
 		}
 
@@ -354,7 +419,6 @@ func (r *multiResponse) Decode(buf []byte) (int, error) {
 	var multiErr error
 
 	r.Ops = make([]multiResponseOp, 0)
-	r.DoneHeader = multiHeader{-1, true, -1}
 	total := 0
 	for {
 		header := &multiHeader{}
@@ -364,7 +428,6 @@ func (r *multiResponse) Decode(buf []byte) (int, error) {
 		}
 		total += n
 		if header.Done {
-			r.DoneHeader = *header
 			break
 		}
 
@@ -396,6 +459,48 @@ func (r *multiResponse) Decode(buf []byte) (int, error) {
 		}
 	}
 	return total, multiErr
+}
+
+func (r *multiReadResponse) Decode(buf []byte) (total int, multiErr error) {
+	for {
+		header := &multiHeader{}
+		n, err := decodePacketValue(buf[total:], reflect.ValueOf(header))
+		if err != nil {
+			return total, err
+		}
+		total += n
+		if header.Done {
+			break
+		}
+
+		var res MultiReadResponse
+		var errCode ErrCode
+		var w reflect.Value
+		switch header.Type {
+		case opGetData:
+			w = reflect.ValueOf(&res.getDataResponse)
+		case opGetChildren:
+			w = reflect.ValueOf(&res.getChildrenResponse)
+		case opError:
+			w = reflect.ValueOf(&errCode)
+		default:
+			return total, ErrAPIError
+		}
+
+		n, err = decodePacketValue(buf[total:], w)
+		if err != nil {
+			return total, err
+		}
+		total += n
+
+		if errCode != errOk {
+			res.Err = errCode.toError()
+		}
+
+		r.OpResults = append(r.OpResults, res)
+	}
+
+	return total, nil
 }
 
 type watcherEvent struct {
@@ -597,7 +702,7 @@ func requestStructForOp(op int32) interface{} {
 	switch op {
 	case opClose:
 		return &closeRequest{}
-	case opCreate:
+	case opCreate, opCreate2:
 		return &CreateRequest{}
 	case opCreateContainer:
 		return &CreateContainerRequest{}
@@ -621,7 +726,7 @@ func requestStructForOp(op int32) interface{} {
 		return &setAclRequest{}
 	case opSetData:
 		return &SetDataRequest{}
-	case opSetWatches:
+	case opSetWatches, opSetWatches2:
 		return &setWatchesRequest{}
 	case opSync:
 		return &syncRequest{}
@@ -633,6 +738,8 @@ func requestStructForOp(op int32) interface{} {
 		return &multiRequest{}
 	case opReconfig:
 		return &reconfigRequest{}
+	case opAddWatch:
+		return &addWatchRequest{}
 	}
 	return nil
 }
