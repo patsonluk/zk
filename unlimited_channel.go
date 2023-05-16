@@ -1,22 +1,32 @@
-//go:build go1.18
-// +build go1.18
-
 package zk
 
 import (
+	"context"
+	"errors"
 	"sync"
 )
 
+var ErrEventQueueClosed = errors.New("zk: event queue closed")
+
 type EventQueue interface {
-	Next() <-chan Event
+	Next(ctx context.Context) (Event, error)
 	push(e Event)
 	close()
 }
 
 type chanEventQueue chan Event
 
-func (c chanEventQueue) Next() <-chan Event {
-	return c
+func (c chanEventQueue) Next(ctx context.Context) (Event, error) {
+	select {
+	case <-ctx.Done():
+		return Event{}, ctx.Err()
+	case e, ok := <-c:
+		if !ok {
+			return Event{}, ErrEventQueueClosed
+		} else {
+			return e, nil
+		}
+	}
 }
 
 func (c chanEventQueue) push(e Event) {
@@ -31,74 +41,67 @@ func newChanEventChannel() chanEventQueue {
 	return make(chan Event, 1)
 }
 
-func newUnlimitedChannelNode() *unlimitedEventQueueNode {
-	return &unlimitedEventQueueNode{event: make(chan Event, 1)}
-}
-
-type unlimitedEventQueueNode struct {
-	event chan Event
-	next  *unlimitedEventQueueNode
-}
-
 type unlimitedEventQueue struct {
-	lock sync.Mutex
-	head *unlimitedEventQueueNode
-	tail *unlimitedEventQueueNode
+	lock     sync.Mutex
+	newEvent chan struct{}
+	events   []Event
 }
 
-// newUnlimitedEventQueue uses a backing unlimitedEventQueue used to effectively turn a buffered channel into a channel
-// with an infinite buffer by storing all incoming elements into a singly-linked queue and popping them as they are
-// read.
 func newUnlimitedEventQueue() *unlimitedEventQueue {
-	head := newUnlimitedChannelNode()
-	q := &unlimitedEventQueue{
-		head: head,
-		tail: head,
+	return &unlimitedEventQueue{
+		newEvent: make(chan struct{}),
 	}
-	return q
 }
 
 func (q *unlimitedEventQueue) push(e Event) {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
-	if q.tail == nil {
+	if q.newEvent == nil {
 		// Panic like a closed channel
 		panic("send on closed unlimited channel")
 	}
 
-	next := newUnlimitedChannelNode()
-	tail := q.tail
-	tail.next = next
-	q.tail = next
-	tail.event <- e
+	q.events = append(q.events, e)
+	close(q.newEvent)
+	q.newEvent = make(chan struct{})
 }
 
 func (q *unlimitedEventQueue) close() {
 	q.lock.Lock()
 	defer q.lock.Unlock()
-	close(q.tail.event)
-	q.tail = nil
+
+	if q.newEvent == nil {
+		// Panic like a closed channel
+		panic("close of closed EventQueue")
+	}
+
+	close(q.newEvent)
+	q.newEvent = nil
 }
 
-var closedChannel = func() <-chan Event {
-	ch := make(chan Event)
-	close(ch)
-	return ch
-}()
+func (q *unlimitedEventQueue) Next(ctx context.Context) (Event, error) {
+	for {
+		q.lock.Lock()
+		if len(q.events) > 0 {
+			e := q.events[0]
+			q.events = q.events[1:]
+			q.lock.Unlock()
+			return e, nil
+		}
 
-func (q *unlimitedEventQueue) Next() <-chan Event {
-	q.lock.Lock()
-	defer q.lock.Unlock()
+		ch := q.newEvent
+		if ch == nil {
+			q.lock.Unlock()
+			return Event{}, ErrEventQueueClosed
+		}
+		q.lock.Unlock()
 
-	if q.head == nil && q.tail == nil {
-		return closedChannel
+		select {
+		case <-ctx.Done():
+			return Event{}, ctx.Err()
+		case <-ch:
+			continue
+		}
 	}
-
-	node := q.head
-	if node.next == nil {
-		node.next = newUnlimitedChannelNode()
-	}
-	q.head = q.head.next
-	return node.event
 }

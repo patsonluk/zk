@@ -221,7 +221,7 @@ func TestNotifyWatches(t *testing.T) {
 						conn.addWatcher(wpt.path, wpt.wType, ch)
 						notifications[idx].ch = ch
 						if wpt.wType.isPersistent() {
-							e := <-ch.Next()
+							e, _ := ch.Next(context.Background())
 							if e.Type != EventWatching {
 								t.Fatalf("First event on persistent watcher should always be EventWatching")
 							}
@@ -232,8 +232,11 @@ func TestNotifyWatches(t *testing.T) {
 					conn.notifyWatches(Event{Type: c.eType, Path: c.path})
 
 					for _, res := range notifications {
-						select {
-						case e := <-res.ch.Next():
+						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+						t.Cleanup(cancel)
+
+						e, err := res.ch.Next(ctx)
+						if err == nil {
 							isPathCorrect :=
 								(res.wType == watchTypePersistentRecursive && strings.HasPrefix(e.Path, res.path)) ||
 									e.Path == res.path
@@ -241,7 +244,7 @@ func TestNotifyWatches(t *testing.T) {
 								t.Logf("unexpeted notification received by %+v: %+v", res, e)
 								t.Fail()
 							}
-						default:
+						} else {
 							if res.notify {
 								t.Logf("expected notification not received for %+v", res)
 								t.Fail()

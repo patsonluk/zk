@@ -3,6 +3,8 @@
 package zk
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"reflect"
 	"testing"
@@ -18,7 +20,7 @@ func TestUnlimitedChannel(t *testing.T) {
 	for i, closeAfterPushes := range []bool{false, true} {
 		t.Run(names[i], func(t *testing.T) {
 			ch := newUnlimitedEventQueue()
-			const eventCount = 2
+			const eventCount = 10
 
 			// check that events can be pushed without consumers
 			for i := 0; i < eventCount; i++ {
@@ -28,36 +30,65 @@ func TestUnlimitedChannel(t *testing.T) {
 				ch.close()
 			}
 
-			events := 0
-			for {
-				actual, ok := <-ch.Next()
+			for events := 0; events < eventCount; events++ {
+				actual, err := ch.Next(context.Background())
+				if err != nil {
+					t.Fatalf("Unexpected error returned from Next (events %d): %+v", events, err)
+				}
 				expected := newEvent(events)
 				if !reflect.DeepEqual(actual, expected) {
-					t.Fatalf("Did not receive expected event from queue (ok: %+v): actual %+v expected %+v",
-						ok, actual, expected)
+					t.Fatalf("Did not receive expected event from queue: actual %+v expected %+v", actual, expected)
 				}
-				events++
-				if events == eventCount {
-					if closeAfterPushes {
-						select {
-						case _, ok := <-ch.Next():
-							if ok {
-								t.Fatal("Next did not return closed channel")
-							}
-						case <-time.After(time.Second):
-							t.Fatal("Next never closed")
-						}
-					} else {
-						select {
-						case e, ok := <-ch.Next():
-							t.Fatalf("Next received unexpected value (%+v) or was closed (%+v)", e, ok)
-						case <-time.After(time.Millisecond * 10):
-							return
-						}
-					}
-					break
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*10)
+			t.Cleanup(cancel)
+
+			_, err := ch.Next(ctx)
+			if closeAfterPushes {
+				if err != ErrEventQueueClosed {
+					t.Fatalf("Did not receive expected error (%v) from Next: %v", ErrEventQueueClosed, err)
+				}
+			} else {
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Fatalf("Next did not exit with cancelled context: %+v", err)
 				}
 			}
 		})
 	}
+	t.Run("interleaving", func(t *testing.T) {
+		ch := newUnlimitedEventQueue()
+
+		for i := 0; i < 10; i++ {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*10)
+			t.Cleanup(cancel)
+
+			expected := newEvent(i)
+
+			ctx = &customContext{
+				Context: ctx,
+				f: func() {
+					ch.push(expected)
+				},
+			}
+
+			actual, err := ch.Next(ctx)
+			if err != nil {
+				t.Fatalf("Received unexpected error from Next: %+v", err)
+			}
+			if !reflect.DeepEqual(expected, actual) {
+				t.Fatalf("Unexpected event received from Next (expected %+v, actual %+v", expected, actual)
+			}
+		}
+	})
+}
+
+type customContext struct {
+	context.Context
+	f func()
+}
+
+func (c *customContext) Done() <-chan struct{} {
+	c.f()
+	return c.Context.Done()
 }

@@ -95,6 +95,7 @@ type Conn struct {
 	recvTimeout    time.Duration
 	connectTimeout time.Duration
 	maxBufferSize  int
+	metricReceiver MetricReceiver
 
 	creds   []authCreds
 	credsMu sync.Mutex // protects server
@@ -211,6 +212,7 @@ func Connect(servers []string, sessionTimeout time.Duration, options ...connOpti
 		logInfo:        true, // default is true for backwards compatability
 		buf:            make([]byte, bufferSize),
 		resendZkAuthFn: resendZkAuth,
+		metricReceiver: UnimplementedMetricReceiver{},
 	}
 
 	// Set provided options.
@@ -313,6 +315,12 @@ func WithMaxBufferSize(maxBufferSize int) connOption {
 func WithMaxConnBufferSize(maxBufferSize int) connOption {
 	return func(c *Conn) {
 		c.buf = make([]byte, maxBufferSize)
+	}
+}
+
+func WithMetricReceiver(mr MetricReceiver) connOption {
+	return func(c *Conn) {
+		c.metricReceiver = mr
 	}
 }
 
@@ -559,8 +567,8 @@ func (c *Conn) notifyWatches(ev Event) {
 			ch.push(ev)
 			if !wpt.wType.isPersistent() {
 				ch.close()
+				delete(c.watchers, wpt)
 			}
-			delete(c.watchers, wpt)
 		}
 	}
 
@@ -841,6 +849,7 @@ func (c *Conn) sendLoop() error {
 				c.conn.Close()
 				return err
 			}
+			c.metricReceiver.PingSent()
 		case <-c.closeChan:
 			return nil
 		}
@@ -899,6 +908,7 @@ func (c *Conn) recvLoop(conn net.Conn) error {
 			c.notifyWatches(ev)
 		} else if res.Xid == -2 {
 			// Ping response. Ignore.
+			c.metricReceiver.PongReceived()
 		} else if res.Xid < 0 {
 			c.logger.Printf("Xid < 0 (%d) but not ping or watcher event", res.Xid)
 		} else {
@@ -987,6 +997,11 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 }
 
 func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
+	start := time.Now()
+	defer func() {
+		c.metricReceiver.RequestCompleted(time.Now().Sub(start))
+	}()
+
 	recv := c.queueRequest(opcode, req, res, recvFunc)
 	select {
 	case r := <-recv:
