@@ -586,10 +586,21 @@ func TestPersistentWatchOnReconnect(t *testing.T) {
 			t.Fatalf("Delete returned error: %+v", err)
 		}
 
-		watchEventsCh, err := zk.AddPersistentWatch(testNode, AddWatchModePersistent)
+		watchEventsQueue, err := zk.AddPersistentWatch(testNode, AddWatchModePersistent)
 		if err != nil {
 			t.Fatalf("AddPersistentWatch returned error: %+v", err)
 		}
+
+		watchEventsCh := make(chan Event)
+		go func() {
+			e, err := watchEventsQueue.Next(context.Background())
+			if err != nil {
+				close(watchEventsCh)
+				return
+			} else {
+				watchEventsCh <- e
+			}
+		}()
 
 		_, err = zk2.Create(testNode, []byte{1}, 0, WorldACL(PermAll))
 		if err != nil {
@@ -598,7 +609,7 @@ func TestPersistentWatchOnReconnect(t *testing.T) {
 
 		// check to see that we received the node creation event
 		select {
-		case ev := <-watchEventsCh.Next():
+		case ev := <-watchEventsCh:
 			if ev.Type != EventNodeCreated {
 				t.Fatalf("Second event on persistent watch was not a node creation event: %+v", ev)
 			}
@@ -616,7 +627,7 @@ func TestPersistentWatchOnReconnect(t *testing.T) {
 
 		// zk should still be waiting to reconnect, so none of the watches should have been triggered
 		select {
-		case <-watchEventsCh.Next():
+		case <-watchEventsCh:
 			t.Fatalf("Persistent watcher for %q should not have triggered yet", testNode)
 		case <-time.After(100 * time.Millisecond):
 		}
@@ -626,7 +637,7 @@ func TestPersistentWatchOnReconnect(t *testing.T) {
 
 		// wait for reconnect event
 		select {
-		case ev := <-watchEventsCh.Next():
+		case ev := <-watchEventsCh:
 			if ev.Type != EventWatching {
 				t.Fatalf("Persistent watcher did not receive reconnect event: %+v", ev)
 			}
@@ -639,7 +650,7 @@ func TestPersistentWatchOnReconnect(t *testing.T) {
 		secondTimeout := time.After(4 * time.Second)
 		for {
 			select {
-			case e := <-watchEventsCh.Next():
+			case e := <-watchEventsCh:
 				if e.Type != EventNodeDataChanged {
 					t.Fatalf("Unexpected event received by persistent watcher: %+v", e)
 				}
@@ -673,13 +684,16 @@ func TestPersistentWatchOnClose(t *testing.T) {
 			t.Fatalf("Could not add persistent watch: %+v", err)
 		}
 		zk.Close()
-		select {
-		case e := <-ch.Next():
-			if e.Type != EventNotWatching {
-				t.Fatalf("Unexpected event: %+v", e)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatalf("Did not get disconnect event")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		t.Cleanup(cancel)
+
+		e, err := ch.Next(ctx)
+		if err != nil {
+			t.Fatalf("Did not get disconnect event (%+v)", err)
+		}
+		if e.Type != EventNotWatching {
+			t.Fatalf("Unexpected event: %+v", e)
 		}
 	})
 }
