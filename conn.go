@@ -996,10 +996,10 @@ func (c *Conn) queueRequest(opcode int32, req interface{}, res interface{}, recv
 	return rq.recvChan
 }
 
-func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (int64, error) {
+func (c *Conn) request(opcode int32, req interface{}, res interface{}, recvFunc func(*request, *responseHeader, error)) (_ int64, err error) {
 	start := time.Now()
 	defer func() {
-		c.metricReceiver.RequestCompleted(time.Now().Sub(start))
+		c.metricReceiver.RequestCompleted(time.Now().Sub(start), err)
 	}()
 
 	recv := c.queueRequest(opcode, req, res, recvFunc)
