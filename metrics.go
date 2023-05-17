@@ -7,7 +7,7 @@ import (
 type MetricReceiver interface {
 	PingSent()
 	PongReceived()
-	RequestCompleted(duration time.Duration)
+	RequestCompleted(duration time.Duration, err error)
 }
 
 var _ MetricReceiver = UnimplementedMetricReceiver{}
@@ -15,6 +15,6 @@ var _ MetricReceiver = UnimplementedMetricReceiver{}
 type UnimplementedMetricReceiver struct {
 }
 
-func (u UnimplementedMetricReceiver) PingSent()                      {}
-func (u UnimplementedMetricReceiver) PongReceived()                  {}
-func (u UnimplementedMetricReceiver) RequestCompleted(time.Duration) {}
+func (u UnimplementedMetricReceiver) PingSent()                             {}
+func (u UnimplementedMetricReceiver) PongReceived()                         {}
+func (u UnimplementedMetricReceiver) RequestCompleted(time.Duration, error) {}
